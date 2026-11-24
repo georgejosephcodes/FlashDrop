@@ -1,0 +1,76 @@
+services:
+
+  redis:
+    image: redis:7-alpine
+    container_name: flashdrop-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: flashdrop-postgres
+    environment:
+      POSTGRES_USER: flashdrop
+      POSTGRES_PASSWORD: flashdrop
+      POSTGRES_DB: flashdrop
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+
+  app1:
+    build: .
+    container_name: flashdrop-app1
+    env_file: .env
+    environment:
+      - INSTANCE_ID=app1
+      - PORT=3000
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  app2:
+    build: .
+    container_name: flashdrop-app2
+    env_file: .env
+    environment:
+      - INSTANCE_ID=app2
+      - PORT=3000
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  worker:
+    build: .
+    container_name: flashdrop-worker
+    command: node src/workers/orderProcessorWorker.js
+    env_file: .env
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    container_name: flashdrop-nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app1
+      - app2
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  postgres-data:
+
