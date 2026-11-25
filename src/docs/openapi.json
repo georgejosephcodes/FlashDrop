@@ -1,0 +1,217 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "FlashDrop API",
+    "version": "1.0.0",
+    "description": "High-concurrency flash sale & ticket booking engine. Atomic Redis Lua reservations, Redis Streams, Write-Behind PostgreSQL sync, and real-time WebSocket push."
+  },
+  "servers": [
+    { "url": "http://localhost:8080", "description": "Local (Docker Compose)" },
+    { "url": "http://localhost:3000", "description": "Local (direct)" }
+  ],
+  "security": [{ "BearerAuth": [] }],
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Clerk session token. Get it from the Clerk dashboard or your frontend `getToken()` call."
+      }
+    },
+    "schemas": {
+      "Item": {
+        "type": "object",
+        "properties": {
+          "id":              { "type": "string", "format": "uuid" },
+          "title":           { "type": "string" },
+          "description":     { "type": "string" },
+          "price_cents":     { "type": "integer" },
+          "total_stock":     { "type": "integer" },
+          "available_stock": { "type": "integer" },
+          "sale_start_at":   { "type": "string", "format": "date-time" },
+          "created_at":      { "type": "string", "format": "date-time" }
+        }
+      },
+      "OrderReservedResponse": {
+        "type": "object",
+        "properties": {
+          "status":       { "type": "string", "example": "RESERVED" },
+          "orderId":      { "type": "string", "format": "uuid" },
+          "holdExpiresAt":{ "type": "string", "format": "date-time" },
+          "message":      { "type": "string" }
+        }
+      },
+      "SoldOutResponse": {
+        "type": "object",
+        "properties": {
+          "status":  { "type": "string", "example": "SOLD_OUT" },
+          "message": { "type": "string" }
+        }
+      },
+      "ConfirmedResponse": {
+        "type": "object",
+        "properties": {
+          "status":      { "type": "string", "example": "CONFIRMED" },
+          "orderId":     { "type": "string", "format": "uuid" },
+          "confirmedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "MetricsResponse": {
+        "type": "object",
+        "properties": {
+          "redisStock":    { "type": "object", "description": "Live stock per itemId from Redis" },
+          "pendingHolds":  { "type": "integer", "description": "Active reservations awaiting payment" },
+          "dbOrderCount":  { "type": "integer", "description": "Total orders persisted in PostgreSQL" },
+          "streamLength":  { "type": "integer", "description": "Current orders:stream entry count" }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/api/items": {
+      "get": {
+        "tags": ["Items"],
+        "summary": "List all items",
+        "description": "Returns all items from PostgreSQL. Live Redis stock is managed separately.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Array of items",
+            "content": {
+              "application/json": {
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Item" } }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": ["Items"],
+        "summary": "Create & seed an item (admin)",
+        "description": "Inserts the item into PostgreSQL and seeds `item:{id}:stock` in Redis. Both happen atomically in the handler.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["title", "priceCents", "totalStock", "saleStartAt"],
+                "properties": {
+                  "title":       { "type": "string", "example": "Nike Air Jordan 1 Retro High OG" },
+                  "description": { "type": "string", "example": "Limited edition sneaker drop" },
+                  "priceCents":  { "type": "integer", "example": 18000 },
+                  "totalStock":  { "type": "integer", "example": 100 },
+                  "saleStartAt": { "type": "string", "format": "date-time", "example": "2026-11-25T12:00:00Z" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Item created and Redis stock seeded",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Item" } } }
+          },
+          "400": { "description": "Validation error" }
+        }
+      }
+    },
+    "/api/orders/checkout": {
+      "post": {
+        "tags": ["Orders"],
+        "summary": "Reserve stock — flash sale checkout",
+        "description": "Atomically checks and decrements stock via Redis Lua script. Returns 202 immediately and processes asynchronously via Redis Streams. Requires `X-Idempotency-Key` header to prevent duplicate clicks.",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "X-Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" },
+            "description": "Client-generated UUID. Duplicate requests with the same key return the cached response."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["itemId", "amountCents"],
+                "properties": {
+                  "itemId":      { "type": "string", "format": "uuid" },
+                  "amountCents": { "type": "integer", "example": 18000 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Stock reserved — complete payment within 10 minutes",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OrderReservedResponse" } } }
+          },
+          "400": { "description": "Missing idempotency key or invalid body" },
+          "401": { "description": "Unauthorized — invalid or missing Clerk token" },
+          "409": {
+            "description": "Sold out",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SoldOutResponse" } } }
+          },
+          "429": { "description": "Rate limit exceeded (20 req/s per IP)" }
+        }
+      }
+    },
+    "/api/orders/{id}/pay": {
+      "post": {
+        "tags": ["Orders"],
+        "summary": "Confirm payment — finalise reservation",
+        "description": "Simulated payment confirmation. Clears the Redis hold and expiry entry, publishes OrderConfirmed to the stream, and pushes a WebSocket notification to the client.",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" },
+            "description": "Order ID returned from the checkout endpoint"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Order confirmed",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConfirmedResponse" } } }
+          },
+          "401": { "description": "Unauthorized" },
+          "410": { "description": "Reservation expired or already processed" }
+        }
+      }
+    },
+    "/api/metrics": {
+      "get": {
+        "tags": ["Observability"],
+        "summary": "Live system metrics",
+        "description": "Returns real-time snapshot: Redis stock levels, pending holds, persisted order count, and stream length.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Metrics snapshot",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MetricsResponse" } } }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": ["Observability"],
+        "summary": "Health check",
+        "security": [],
+        "responses": {
+          "200": { "description": "Instance is up", "content": { "application/json": { "schema": { "type": "object", "properties": { "status": { "type": "string" }, "instance": { "type": "string" } } } } } }
+        }
+      }
+    }
+  }
+}
+
