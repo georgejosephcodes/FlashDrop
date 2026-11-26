@@ -16,6 +16,7 @@
 
 'use strict';
 
+require('dotenv').config({ path: '.env.local', override: false });
 require('dotenv').config();
 const { Pool }  = require('pg');
 const Redis     = require('ioredis');
