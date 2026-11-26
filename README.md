@@ -1,5 +1,7 @@
 # FlashDrop ⚡
 
+[![CI](https://github.com/georgejosephcodes/FlashDrop/actions/workflows/ci.yml/badge.svg)](https://github.com/georgejosephcodes/FlashDrop/actions/workflows/ci.yml)
+
 > High-concurrency flash sale & ticket booking engine — built to handle the exact problem Ticketmaster, BookMyShow, and Nike SNKRS face: **10,000+ users attempting to buy 100 items at the exact same second.**
 
 FlashDrop eliminates database row-locking bottlenecks by decoupling the ingest layer, using **Redis atomic Lua scripts** for sub-millisecond stock reservation, **Redis Streams** as an ordered event sequencer, and persisting data asynchronously via a **Write-Behind buffering pipeline** with real-time **WebSocket push notifications**.
