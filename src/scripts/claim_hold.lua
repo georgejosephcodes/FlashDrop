@@ -1,11 +1,13 @@
 -- claim_hold.lua
--- Atomically verify hold ownership + expiry, consume hold, and remove from expiry sorted set.
+-- Atomically verify hold ownership + expiry, consume hold, clean expiry set,
+-- and append OrderConfirmed to orders:stream.
 -- KEYS[1] = hold:{orderId}
 -- KEYS[2] = holds:expiry
+-- KEYS[3] = orders:stream
 -- ARGV[1] = callerUserId
 -- ARGV[2] = nowMs (epoch ms)
 -- ARGV[3] = orderId
--- Returns: { status, userId?, itemId? }
+-- Returns: { status, userId?, itemId?, streamId? }
 
 local val = redis.call('GET', KEYS[1])
 if not val then
@@ -30,5 +32,13 @@ end
 redis.call('DEL', KEYS[1])
 redis.call('ZREM', KEYS[2], ARGV[3])
 
-return { 'OK', userId, itemId }
+local streamId = redis.call(
+  'XADD', KEYS[3], '*',
+  'event',     'OrderConfirmed',
+  'orderId',   ARGV[3],
+  'userId',    userId,
+  'itemId',    itemId,
+  'timestamp', ARGV[2]
+)
 
+return { 'OK', userId, itemId, streamId }

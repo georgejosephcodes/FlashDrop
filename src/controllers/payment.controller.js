@@ -5,18 +5,17 @@
  *
  * Flow:
  *  1. Validate :id is a UUID and identify authenticated user via getUserId(req)
- *  2. Run claim_hold.lua atomically (verifies ownership, checks deadline, DEL hold + ZREM expiry)
+ *  2. Run claim_hold.lua atomically (verifies ownership, checks deadline,
+ *     DEL hold + ZREM expiry + XADD OrderConfirmed in one Redis transaction)
  *  3. Return 403 if non-owner, 410 if missing/expired
- *  4. Publish OrderConfirmed to Redis Stream → dbSyncWorker persists CONFIRMED
- *  5. Publish to Pub/Sub → socketService pushes order:confirmed to client
- *  6. Return 200
+ *  4. Publish best-effort WebSocket push via Redis Pub/Sub
+ *  5. Return 200
  */
 
-const { z }                     = require('zod');
-const { getRedisClient }        = require('../config/redis');
-const { getUserId }             = require('../middleware/auth');
-const { claimHold }             = require('../services/redisService');
-const { publishOrderConfirmed } = require('../services/streamService');
+const { z }              = require('zod');
+const { getRedisClient } = require('../config/redis');
+const { getUserId }      = require('../middleware/auth');
+const { claimHold }      = require('../services/redisService');
 
 const uuidSchema = z.string().uuid();
 
@@ -32,7 +31,7 @@ async function pay(req, res) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    // 1. Atomically verify ownership, deadline, and consume the hold
+    // Atomically verify ownership, deadline, consume hold, and append OrderConfirmed
     const result = await claimHold(orderId, callerUserId);
 
     if (result.status === 'FORBIDDEN') {
@@ -48,20 +47,19 @@ async function pay(req, res) {
       });
     }
 
-    const { userId, itemId } = result;
+    const { userId }  = result;
     const confirmedAt = new Date().toISOString();
     const redis       = getRedisClient();
 
-    // 2. Publish confirmed event → dbSyncWorker will UPSERT status=CONFIRMED
-    await publishOrderConfirmed({ orderId, userId, itemId });
-
-    // 3. Push real-time notification to client
-    await redis.publish('order:events', JSON.stringify({
+    // Best-effort real-time WebSocket notification (durable OrderConfirmed is already in stream)
+    redis.publish('order:events', JSON.stringify({
       type: 'order:confirmed',
       orderId,
       userId,
       confirmedAt,
-    }));
+    })).catch((err) => {
+      console.error('[Payment] Pub/Sub notify failed:', err.message);
+    });
 
     console.log(`[Payment] Confirmed orderId=${orderId} userId=${userId}`);
 
