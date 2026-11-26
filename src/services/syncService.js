@@ -6,37 +6,29 @@
  *   - Buffer reaching SYNC_BATCH_SIZE records (default 50)
  *   - SYNC_INTERVAL_MS milliseconds elapsing since last flush (default 500ms)
  *
- * WHY this matters:
- *   10,000 individual INSERTs → PostgreSQL collapse.
- *   20 bulk INSERTs of 500 records → DB stays stable, IOPS drop 95%+.
- *
- * ON CONFLICT DO NOTHING makes every flush idempotent — safe to retry
- * if the worker crashes mid-flush.
+ * Only invokes the onFlushed(streamIds) callback AFTER PostgreSQL confirms the
+ * bulk UPSERT, so Redis Stream messages are never ACKed before durable writes.
  */
 
 const { query } = require('../config/db');
 const env       = require('../config/env');
 
-const BATCH_SIZE    = env.SYNC_BATCH_SIZE;    // default 50
-const INTERVAL_MS   = env.SYNC_INTERVAL_MS;   // default 500
+const BATCH_SIZE  = env.SYNC_BATCH_SIZE;    // default 50
+const INTERVAL_MS = env.SYNC_INTERVAL_MS;   // default 500
 
-let buffer      = [];      // pending order records
-let lastFlushAt = Date.now();
-let flushTimer  = null;
+let buffer        = [];      // pending order records
+let lastFlushAt   = Date.now();
+let flushTimer    = null;
+let onFlushedCb   = null;    // optional async callback(streamIds[])
+let activeFlush   = null;    // serializes concurrent flush() calls
+
+function setOnFlushed(fn) {
+  onFlushedCb = fn;
+}
 
 /**
  * Add an order record to the buffer.
  * Triggers an immediate flush if the batch size threshold is reached.
- *
- * @param {{
- *   orderId:        string,
- *   userId:         string,
- *   itemId:         string,
- *   status:         'RESERVED'|'CONFIRMED'|'EXPIRED'|'CANCELLED',
- *   amountCents:    number,
- *   idempotencyKey: string,
- *   holdExpiresAt?: string,
- * }} record
  */
 function enqueue(record) {
   buffer.push(record);
@@ -46,70 +38,79 @@ function enqueue(record) {
   }
 }
 
-/**
- * Flush all buffered records to PostgreSQL in a single bulk INSERT.
- * Safe to call even when the buffer is empty.
- */
-async function flush() {
-  if (buffer.length === 0) return;
+async function executeFlush() {
+  while (buffer.length > 0) {
+    const rawBatch = buffer.splice(0, buffer.length);
+    lastFlushAt    = Date.now();
 
-  const rawBatch  = buffer.splice(0, buffer.length);  // drain buffer atomically
-  lastFlushAt     = Date.now();
+    // Deduplicate by orderId within a single batch so Postgres ON CONFLICT never
+    // updates the same row twice in one INSERT statement.
+    const byOrderId = new Map();
+    for (const r of rawBatch) {
+      const prev = byOrderId.get(r.orderId);
+      byOrderId.set(r.orderId, prev ? {
+        ...prev,
+        ...r,
+        idempotencyKey: prev.idempotencyKey !== r.orderId ? prev.idempotencyKey : r.idempotencyKey,
+        amountCents:    r.amountCents || prev.amountCents,
+        holdExpiresAt:  r.holdExpiresAt ?? prev.holdExpiresAt,
+      } : r);
+    }
+    const toInsert = Array.from(byOrderId.values());
 
-  // Deduplicate by orderId within a single batch so Postgres ON CONFLICT never
-  // updates the same row twice in one INSERT statement.
-  const byOrderId = new Map();
-  for (const r of rawBatch) {
-    const prev = byOrderId.get(r.orderId);
-    byOrderId.set(r.orderId, prev ? {
-      ...prev,
-      ...r,
-      idempotencyKey: prev.idempotencyKey !== r.orderId ? prev.idempotencyKey : r.idempotencyKey,
-      amountCents:    r.amountCents || prev.amountCents,
-      holdExpiresAt:  r.holdExpiresAt ?? prev.holdExpiresAt,
-    } : r);
-  }
-  const toInsert = Array.from(byOrderId.values());
+    const values = [];
+    const placeholders = toInsert.map((r, i) => {
+      const base = i * 7;
+      values.push(
+        r.orderId,
+        r.userId,
+        r.itemId,
+        r.status,
+        r.amountCents,
+        r.idempotencyKey,
+        r.holdExpiresAt ?? null
+      );
+      return `($${base+1}, $${base+2}, $${base+3}, $${base+4}, $${base+5}, $${base+6}, $${base+7})`;
+    });
 
-  // Build parameterised bulk INSERT
-  // Each row needs 7 values → $1..$7, $8..$14, ...
-  const values  = [];
-  const placeholders = toInsert.map((r, i) => {
-    const base = i * 7;
-    values.push(
-      r.orderId,
-      r.userId,
-      r.itemId,
-      r.status,
-      r.amountCents,
-      r.idempotencyKey,
-      r.holdExpiresAt ?? null
-    );
-    return `($${base+1}, $${base+2}, $${base+3}, $${base+4}, $${base+5}, $${base+6}, $${base+7})`;
-  });
+    const sql = `
+      INSERT INTO orders (id, user_id, item_id, status, amount_cents, idempotency_key, hold_expires_at)
+      VALUES ${placeholders.join(', ')}
+      ON CONFLICT (id) DO UPDATE
+        SET status     = EXCLUDED.status,
+            updated_at = NOW()
+    `;
 
-  const sql = `
-    INSERT INTO orders (id, user_id, item_id, status, amount_cents, idempotency_key, hold_expires_at)
-    VALUES ${placeholders.join(', ')}
-    ON CONFLICT (id) DO UPDATE
-      SET status     = EXCLUDED.status,
-          updated_at = NOW()
-  `;
+    try {
+      const result = await query(sql, values);
+      console.log(`[SyncService] Flushed ${toInsert.length} record(s) → DB rows affected: ${result.rowCount}`);
 
-  try {
-    const result = await query(sql, values);
-    console.log(`[SyncService] Flushed ${toInsert.length} record(s) → DB rows affected: ${result.rowCount}`);
-  } catch (err) {
-    // On DB error: put records back at the front of the buffer for next flush
-    buffer.unshift(...toInsert);
-    throw err;
+      const streamIds = rawBatch.map(r => r.streamId).filter(Boolean);
+      if (streamIds.length > 0 && onFlushedCb) {
+        await onFlushedCb(streamIds);
+      }
+    } catch (err) {
+      // Restore full rawBatch (preserving streamIds) to buffer on DB failure
+      buffer.unshift(...rawBatch);
+      throw err;
+    }
   }
 }
 
 /**
- * Start the interval-based auto-flush timer.
- * Call once at worker startup.
+ * Flush all buffered records to PostgreSQL in a single bulk INSERT.
+ * Serialized so overlapping timer/batch triggers never collide.
  */
+async function flush() {
+  if (buffer.length === 0) return;
+  if (activeFlush) return activeFlush;
+
+  activeFlush = executeFlush().finally(() => {
+    activeFlush = null;
+  });
+  return activeFlush;
+}
+
 function startAutoFlush() {
   if (flushTimer) return;
 
@@ -123,10 +124,6 @@ function startAutoFlush() {
   console.log(`[SyncService] Auto-flush started — batch=${BATCH_SIZE} interval=${INTERVAL_MS}ms`);
 }
 
-/**
- * Stop the auto-flush timer and flush any remaining records.
- * Call on graceful shutdown.
- */
 async function shutdown() {
   if (flushTimer) {
     clearInterval(flushTimer);
@@ -136,5 +133,4 @@ async function shutdown() {
   console.log('[SyncService] Shutdown complete — buffer drained');
 }
 
-module.exports = { enqueue, flush, startAutoFlush, shutdown };
-
+module.exports = { enqueue, flush, startAutoFlush, shutdown, setOnFlushed };
