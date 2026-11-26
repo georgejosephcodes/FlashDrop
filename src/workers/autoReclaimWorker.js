@@ -2,19 +2,13 @@
  * autoReclaimWorker.js
  *
  * Polls the `holds:expiry` sorted set every 5 seconds.
- * Any orderId whose score (expiry timestamp in ms) is <= now has timed out
- * without payment — this worker restores its inventory and fires the
- * OrderExpired event.
- *
- * WHY a sorted set instead of Redis keyspace notifications:
- *   Keyspace notifications can be dropped on reconnect or when the subscriber
- *   is restarting. Polling a sorted set is reliable — entries stay until
- *   explicitly removed, so a crashed worker will catch them on restart.
+ * Uses reclaim_hold.lua so hold deletion, sorted-set cleanup, and stock
+ * restoration execute atomically — preventing payment-vs-expiry races.
  */
 
 require('dotenv').config();
-const { getRedisClient }     = require('../config/redis');
-const { restoreStock }       = require('../services/redisService');
+const { getRedisClient }      = require('../config/redis');
+const { reclaimHold }         = require('../services/redisService');
 const { publishOrderExpired } = require('../services/streamService');
 
 const POLL_INTERVAL_MS = 5000;
@@ -31,43 +25,30 @@ async function reclaimExpired(redis) {
 
   for (const orderId of expired) {
     try {
-      const holdKey = `hold:${orderId}`;
-      const holdVal = await redis.get(holdKey);
+      const result = await reclaimHold(orderId);
 
-      if (!holdVal) {
-        // Hold already cleared (user paid in time) — just clean up sorted set
-        await redis.zrem('holds:expiry', orderId);
+      if (result.status !== 'RECLAIMED') {
         continue;
       }
 
-      // holdVal format: "{userId}:{itemId}"
-      const [userId, itemId] = holdVal.split(':');
+      const { userId, itemId } = result;
 
-      // 1. Restore 1 unit of stock back to Redis — next buyer can grab it
-      await restoreStock(itemId);
-
-      // 2. Remove from sorted set
-      await redis.zrem('holds:expiry', orderId);
-
-      // 3. Delete the hold key (may already be expired via TTL, DEL is safe)
-      await redis.del(holdKey);
-
-      // 4. Publish OrderExpired event to stream → dbSyncWorker will persist it
+      // Publish OrderExpired event to stream → dbSyncWorker will persist EXPIRED
       await publishOrderExpired({ orderId, userId, itemId });
 
-      // 5. Notify client via Pub/Sub → socketService pushes order:expired
+      // Notify client via Pub/Sub → socketService pushes order:expired
       await redis.publish('order:events', JSON.stringify({
-        type:    'order:expired',
+        type:   'order:expired',
         orderId,
         userId,
-        reason:  'Payment timeout — hold released, stock restored.',
+        reason: 'Payment timeout — hold released, stock restored.',
       }));
 
       console.log(`[AutoReclaim] Reclaimed orderId=${orderId} itemId=${itemId} stock restored`);
 
     } catch (err) {
       console.error(`[AutoReclaim] Error processing orderId=${orderId}:`, err.message);
-      // Don't remove from sorted set on error — will retry next poll cycle
+      // Will retry next poll cycle
     }
   }
 }
@@ -76,9 +57,12 @@ async function run() {
   const redis = getRedisClient();
   console.log(`[AutoReclaim] Starting — polling every ${POLL_INTERVAL_MS / 1000}s`);
 
-  // Run immediately on start, then on interval
   while (true) {
-    await reclaimExpired(redis);
+    try {
+      await reclaimExpired(redis);
+    } catch (err) {
+      console.error('[AutoReclaim] Poll error:', err.message);
+    }
     await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
   }
 }
@@ -87,4 +71,3 @@ run().catch((err) => {
   console.error('[AutoReclaim] Fatal error:', err);
   process.exit(1);
 });
-

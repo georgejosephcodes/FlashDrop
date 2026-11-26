@@ -3,26 +3,23 @@
  *
  * Reads OrderReserved events from the Redis Stream using a Consumer Group.
  * For each event:
- *   1. Creates a 10-minute hold key in Redis (SET hold:{orderId})
- *   2. Adds orderId to the sorted set for reliable expiry polling
- *   3. Publishes to Redis Pub/Sub so the WebSocket gateway can push to the client
+ *   1. Creates a hold key in Redis with a failsafe TTL > holdTTL so Redis TTL
+ *      never deletes itemId before autoReclaimWorker can restore stock.
+ *   2. Adds orderId to the holds:expiry sorted set (score = exact expiry deadline)
+ *   3. Publishes to Redis Pub/Sub so Socket.io can push to the client
  *   4. ACKs the message so it leaves the Pending Entries List (PEL)
- *
- * If this worker crashes mid-message the entry stays unACK'd in the PEL
- * and will be reclaimed on restart — zero lost events.
  */
 
 require('dotenv').config();
-const { getRedisClient }  = require('../config/redis');
-const env                 = require('../config/env');
+const { getRedisClient } = require('../config/redis');
+const env                = require('../config/env');
 
-const STREAM_KEY   = 'orders:stream';
-const GROUP_NAME   = 'orderProcessors';
-const CONSUMER     = `worker-${process.pid}`;
-const BLOCK_MS     = 2000;   // block up to 2s waiting for new entries
-const BATCH_COUNT  = 10;     // messages per read
+const STREAM_KEY  = 'orders:stream';
+const GROUP_NAME  = 'orderProcessors';
+const CONSUMER    = `worker-${process.pid}`;
+const BLOCK_MS    = 2000;
+const BATCH_COUNT = 10;
 
-/** Parse a flat Redis stream field array into a plain object */
 function parseFields(fields) {
   const obj = {};
   for (let i = 0; i < fields.length; i += 2) {
@@ -31,31 +28,42 @@ function parseFields(fields) {
   return obj;
 }
 
+async function initGroup(redis) {
+  try {
+    await redis.xgroup('CREATE', STREAM_KEY, GROUP_NAME, '0', 'MKSTREAM');
+    console.log(`[OrderProcessor] Consumer group "${GROUP_NAME}" created`);
+  } catch (err) {
+    if (err.message.includes('BUSYGROUP')) {
+      console.log(`[OrderProcessor] Consumer group "${GROUP_NAME}" already exists — OK`);
+    } else {
+      throw err;
+    }
+  }
+}
+
 async function processMessage(redis, streamId, fields) {
   const { event, orderId, userId, itemId } = fields;
 
   if (event !== 'OrderReserved') {
-    // Skip events not meant for this worker; still ACK so they don't clog PEL
     await redis.xack(STREAM_KEY, GROUP_NAME, streamId);
     return;
   }
 
-  const holdTTL      = env.HOLD_TTL_SECONDS;                       // default 600
-  const expireAt     = Date.now() + holdTTL * 1000;                // epoch ms
-  const holdKey      = `hold:${orderId}`;
-  const holdValue    = `${userId}:${itemId}`;
+  const holdTTL     = env.HOLD_TTL_SECONDS;         // default 600s
+  const expireAt    = Date.now() + holdTTL * 1000;  // exact deadline (epoch ms)
+  const failsafeTTL = holdTTL + 3600;               // +1h buffer so reclaim always sees userId/itemId
+  const holdKey     = `hold:${orderId}`;
+  const holdValue   = `${userId}:${itemId}:${expireAt}`;
 
-  // 1. Set the reservation hold with TTL (failsafe if worker dies before ZADD)
-  await redis.set(holdKey, holdValue, 'EX', holdTTL);
+  // 1. Set hold key with failsafe TTL (> deadline)
+  await redis.set(holdKey, holdValue, 'EX', failsafeTTL);
 
-  // 2. Add to sorted set — score = expiry timestamp for reliable polling
-  //    autoReclaimWorker polls this set every 5s instead of relying on keyspace events
+  // 2. Add to sorted set — score = exact expiry timestamp for reliable polling
   await redis.zadd('holds:expiry', expireAt, orderId);
 
   // 3. Notify WebSocket gateway via Pub/Sub
-  //    socketService subscribes to this channel and emits to room:user_{userId}
   await redis.publish('order:events', JSON.stringify({
-    type:    'order:reserved',
+    type:      'order:reserved',
     orderId,
     userId,
     itemId,
@@ -68,26 +76,40 @@ async function processMessage(redis, streamId, fields) {
   console.log(`[OrderProcessor] Reserved orderId=${orderId} userId=${userId} expires=${new Date(expireAt).toISOString()}`);
 }
 
+async function drainPending(redis) {
+  while (true) {
+    const pending = await redis.xpending(STREAM_KEY, GROUP_NAME, '-', '+', BATCH_COUNT);
+    if (!pending || pending.length === 0) break;
+
+    console.log(`[OrderProcessor] Reclaiming ${pending.length} pending message(s) from PEL`);
+    let progressed = 0;
+
+    for (const p of pending) {
+      const claimed = await redis.xclaim(STREAM_KEY, GROUP_NAME, CONSUMER, 0, p[0]);
+      if (claimed && claimed.length > 0 && claimed[0][1]) {
+        const [streamId, fields] = claimed[0];
+        await processMessage(redis, streamId, parseFields(fields));
+        progressed++;
+      } else {
+        // Entry no longer in stream — ACK so PEL clears cleanly
+        await redis.xack(STREAM_KEY, GROUP_NAME, p[0]);
+        progressed++;
+      }
+    }
+
+    if (progressed === 0) break;
+  }
+}
+
 async function run() {
-  // Worker needs its own Redis client for XREADGROUP (blocking command)
   const redis = getRedisClient();
+  await initGroup(redis);
 
   console.log(`[OrderProcessor] Starting consumer "${CONSUMER}" on stream "${STREAM_KEY}"`);
 
-  // On startup: reclaim any messages stuck in PEL from a previous crashed worker
-  const pending = await redis.xpending(STREAM_KEY, GROUP_NAME, '-', '+', 10);
-  if (pending.length > 0) {
-    console.log(`[OrderProcessor] Reclaiming ${pending.length} pending messages from PEL`);
-    for (const p of pending) {
-      const claimed = await redis.xclaim(STREAM_KEY, GROUP_NAME, CONSUMER, 0, p[0]);
-      if (claimed.length > 0) {
-        const [streamId, fields] = claimed[0];
-        await processMessage(redis, streamId, parseFields(fields));
-      }
-    }
-  }
+  // Recover ALL pending messages stuck in PEL from previous crashed workers
+  await drainPending(redis);
 
-  // Main loop: block-read new messages
   while (true) {
     try {
       const results = await redis.xreadgroup(
@@ -97,7 +119,7 @@ async function run() {
         'STREAMS', STREAM_KEY, '>'
       );
 
-      if (!results) continue;  // timeout — no new messages, loop again
+      if (!results) continue;
 
       for (const [, messages] of results) {
         for (const [streamId, fields] of messages) {
@@ -106,10 +128,12 @@ async function run() {
       }
     } catch (err) {
       console.error('[OrderProcessor] Error:', err.message);
-      await new Promise(r => setTimeout(r, 1000));  // back off before retry
+      await new Promise(r => setTimeout(r, 1000));
     }
   }
 }
 
-run();
-
+run().catch((err) => {
+  console.error('[OrderProcessor] Fatal error:', err);
+  process.exit(1);
+});
