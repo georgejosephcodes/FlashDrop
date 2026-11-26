@@ -2,7 +2,8 @@ const fs                = require('fs');
 const path              = require('path');
 const { getRedisClient } = require('../config/redis');
 
-const _shas = {};  // cached EVALSHA handles by script filename
+const STREAM_KEY = 'orders:stream';
+const _shas      = {};  // cached EVALSHA handles by script filename
 
 async function loadScript(filename) {
   if (_shas[filename]) return _shas[filename];
@@ -48,57 +49,82 @@ async function loadLuaScript() {
 }
 
 /**
- * Atomically reserve 1 unit of stock for an item.
- * @param {string} itemId
- * @returns {Promise<'SUCCESS'|'SOLD_OUT'>}
+ * Atomically check durable reservation mapping, decrement stock, append
+ * OrderReserved to orders:stream, and persist user-scoped reservation mapping.
+ *
+ * @param {{ orderId: string, userId: string, itemId: string, amountCents: number, idempotencyKey: string, reservationKey: string, mappingTtlSeconds?: number }} params
+ * @returns {Promise<{ status: 'SUCCESS'|'EXISTING'|'SOLD_OUT', orderId?: string, streamId?: string }>}
  */
-async function reserveStock(itemId) {
-  const key    = `item:${itemId}:stock`;
-  const result = await evalScript('reserve_stock.lua', 1, key);
-  return result === 1 ? 'SUCCESS' : 'SOLD_OUT';
+async function reserveStock({
+  orderId,
+  userId,
+  itemId,
+  amountCents,
+  idempotencyKey,
+  reservationKey,
+  mappingTtlSeconds = 86400,
+}) {
+  const res = await evalScript(
+    'reserve_stock.lua',
+    3,
+    `item:${itemId}:stock`,
+    STREAM_KEY,
+    reservationKey,
+    orderId,
+    userId,
+    itemId,
+    String(amountCents),
+    idempotencyKey,
+    String(Date.now()),
+    String(mappingTtlSeconds)
+  );
+
+  if (res[0] === 2) {
+    return { status: 'EXISTING', orderId: res[1] };
+  }
+  if (res[0] === 1) {
+    return { status: 'SUCCESS', streamId: res[1], orderId: res[2] };
+  }
+  return { status: 'SOLD_OUT' };
 }
 
 /**
- * Atomically claim an active hold for payment after verifying ownership & deadline.
- * @param {string} orderId
- * @param {string} callerUserId
- * @returns {Promise<{ status: 'OK'|'NOT_FOUND'|'FORBIDDEN'|'EXPIRED', userId?: string, itemId?: string }>}
+ * Atomically claim an active hold for payment, verify ownership & deadline,
+ * consume the hold, and append OrderConfirmed to orders:stream.
  */
 async function claimHold(orderId, callerUserId) {
-  const [status, userId, itemId] = await evalScript(
+  const [status, userId, itemId, streamId] = await evalScript(
     'claim_hold.lua',
-    2,
+    3,
     `hold:${orderId}`,
     'holds:expiry',
+    STREAM_KEY,
     callerUserId,
     String(Date.now()),
     orderId
   );
-  return { status, userId, itemId };
+  return { status, userId, itemId, streamId };
 }
 
 /**
- * Atomically reclaim an expired hold and restore 1 unit of stock.
- * @param {string} orderId
- * @returns {Promise<{ status: 'RECLAIMED'|'ALREADY_HANDLED'|'NOT_EXPIRED', userId?: string, itemId?: string }>}
+ * Atomically reclaim an expired hold, restore stock, and append OrderExpired
+ * to orders:stream.
  */
 async function reclaimHold(orderId) {
-  const [status, userId, itemId] = await evalScript(
+  const [status, userId, itemId, streamId] = await evalScript(
     'reclaim_hold.lua',
-    2,
+    3,
     `hold:${orderId}`,
     'holds:expiry',
+    STREAM_KEY,
     orderId,
     String(Date.now())
   );
-  return { status, userId, itemId };
+  return { status, userId, itemId, streamId };
 }
 
 /**
- * Seed stock for a new item into Redis.
- * Called by the items controller after inserting to Postgres.
- * @param {string} itemId
- * @param {number} stock
+ * Seed stock (and optional cached metadata) for a new item into Redis.
  */
 async function seedItemStock(itemId, stock, meta = null) {
   const redis = getRedisClient();
@@ -111,8 +137,6 @@ async function seedItemStock(itemId, stock, meta = null) {
 
 /**
  * Get cached item metadata (priceCents, saleStartAt) from Redis.
- * @param {string} itemId
- * @returns {Promise<{ priceCents: number, saleStartAt: string }|null>}
  */
 async function getItemMeta(itemId) {
   const redis = getRedisClient();
@@ -122,8 +146,6 @@ async function getItemMeta(itemId) {
 
 /**
  * Get current live stock for an item from Redis.
- * @param {string} itemId
- * @returns {Promise<number>}
  */
 async function getLiveStock(itemId) {
   const redis = getRedisClient();
@@ -132,8 +154,7 @@ async function getLiveStock(itemId) {
 }
 
 /**
- * Restore stock by 1 (used as compensating action on publish failure).
- * @param {string} itemId
+ * Restore stock by 1.
  */
 async function restoreStock(itemId) {
   const redis = getRedisClient();
