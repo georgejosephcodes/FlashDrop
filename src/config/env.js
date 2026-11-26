@@ -29,6 +29,12 @@ if (!parsed.success) {
 
 const data = parsed.data;
 
+// Disallow SKIP_AUTH in production
+if (data.NODE_ENV === 'production' && data.SKIP_AUTH === 'true') {
+  console.error('❌  SKIP_AUTH=true is forbidden when NODE_ENV=production.');
+  process.exit(1);
+}
+
 // Enforce Clerk keys only when auth is not skipped
 if (data.SKIP_AUTH !== 'true' && (!data.CLERK_PUBLISHABLE_KEY || !data.CLERK_SECRET_KEY)) {
   console.error('❌  CLERK_PUBLISHABLE_KEY and CLERK_SECRET_KEY are required when SKIP_AUTH is not true.');
