@@ -5,20 +5,27 @@
  * "dbSyncers", batches them into syncService, and ACKs stream IDs ONLY AFTER
  * PostgreSQL confirms the bulk UPSERT.
  *
- * On startup, drains any un-ACKed messages from PEL ('0') before reading
- * new entries ('>') so crashes or DB outages never lose orders.
+ * Uses Redis XAUTOCLAIM on startup (and periodically) so pending entries left
+ * by crashed or old consumers (different PIDs) are recovered and flushed.
  */
 
 require('dotenv').config();
-const { getRedisClient }                                 = require('../config/redis');
-const { enqueue, flush, startAutoFlush, shutdown, setOnFlushed } = require('../services/syncService');
-const env                                                = require('../config/env');
+const { getRedisClient } = require('../config/redis');
+const {
+  enqueue,
+  flush,
+  startAutoFlush,
+  shutdown,
+  setOnFlushed,
+} = require('../services/syncService');
+const env = require('../config/env');
 
-const STREAM_KEY  = 'orders:stream';
-const GROUP_NAME  = 'dbSyncers';
-const CONSUMER    = `dbsync-${process.pid}`;
-const BLOCK_MS    = 2000;
-const BATCH_COUNT = 50;
+const STREAM_KEY    = 'orders:stream';
+const GROUP_NAME    = 'dbSyncers';
+const CONSUMER      = `dbsync-${process.pid}`;
+const BLOCK_MS      = 2000;
+const BATCH_COUNT   = 50;
+const CLAIM_IDLE_MS = parseInt(process.env.DB_SYNC_CLAIM_IDLE_MS || '5000', 10);
 
 function parseFields(fields) {
   const obj = {};
@@ -69,34 +76,61 @@ async function initGroup(redis) {
   }
 }
 
-async function drainPending(streamRedis, ackRedis) {
+/**
+ * Reclaim stale pending entries from ANY consumer (including dead/previous PIDs)
+ * using XAUTOCLAIM, enqueue them, and flush to PostgreSQL before ACKing.
+ */
+async function reclaimStalePending(
+  ackRedis,
+  minIdleMs = CLAIM_IDLE_MS,
+  {
+    streamKey = STREAM_KEY,
+    groupName = GROUP_NAME,
+    consumer  = CONSUMER,
+  } = {}
+) {
+  let cursor = '0-0';
+
   while (true) {
-    const results = await streamRedis.xreadgroup(
-      'GROUP', GROUP_NAME, CONSUMER,
-      'COUNT', BATCH_COUNT,
-      'STREAMS', STREAM_KEY, '0'
+    const [nextCursor, messages, deletedIds] = await ackRedis.xautoclaim(
+      streamKey,
+      groupName,
+      consumer,
+      minIdleMs,
+      cursor,
+      'COUNT',
+      BATCH_COUNT
     );
 
-    const messages = results?.[0]?.[1];
-    if (!messages || messages.length === 0) break;
-
-    console.log(`[DBSync] Recovering ${messages.length} pending entry(ies) from PEL`);
-    for (const [streamId, rawFields] of messages) {
-      const record = toRecord(parseFields(rawFields), streamId);
-      if (record) {
-        enqueue(record);
-      } else {
-        await ackRedis.xack(STREAM_KEY, GROUP_NAME, streamId);
-      }
+    if (deletedIds && deletedIds.length > 0) {
+      await ackRedis.xack(streamKey, groupName, ...deletedIds);
     }
 
-    await flush();
+    if (messages && messages.length > 0) {
+      console.log(`[DBSync] Reclaimed ${messages.length} pending entry(ies) via XAUTOCLAIM`);
+      for (const [streamId, rawFields] of messages) {
+        if (!rawFields) {
+          await ackRedis.xack(streamKey, groupName, streamId);
+          continue;
+        }
+        const record = toRecord(parseFields(rawFields), streamId);
+        if (record) {
+          enqueue(record);
+        } else {
+          await ackRedis.xack(streamKey, groupName, streamId);
+        }
+      }
+      await flush();
+    }
+
+    if (!nextCursor || nextCursor === '0-0') break;
+    cursor = nextCursor;
   }
 }
 
 async function run() {
   const streamRedis = getRedisClient();
-  // Separate non-blocking connection so XACK never waits behind XREADGROUP BLOCK
+  // Separate non-blocking connection so XACK / XAUTOCLAIM never wait behind XREADGROUP BLOCK
   const ackRedis    = streamRedis.duplicate();
 
   await initGroup(streamRedis);
@@ -119,7 +153,10 @@ async function run() {
     process.exit(0);
   });
 
-  await drainPending(streamRedis, ackRedis);
+  // On boot, recover any stale pending entries left by crashed/old consumers
+  await reclaimStalePending(ackRedis);
+
+  let lastReclaimAt = Date.now();
 
   while (true) {
     try {
@@ -130,19 +167,24 @@ async function run() {
         'STREAMS', STREAM_KEY, '>'
       );
 
-      if (!results) continue;
+      if (results) {
+        for (const [, messages] of results) {
+          for (const [streamId, rawFields] of messages) {
+            const fields = parseFields(rawFields);
+            const record = toRecord(fields, streamId);
 
-      for (const [, messages] of results) {
-        for (const [streamId, rawFields] of messages) {
-          const fields = parseFields(rawFields);
-          const record = toRecord(fields, streamId);
-
-          if (record) {
-            enqueue(record);
-          } else {
-            await ackRedis.xack(STREAM_KEY, GROUP_NAME, streamId);
+            if (record) {
+              enqueue(record);
+            } else {
+              await ackRedis.xack(STREAM_KEY, GROUP_NAME, streamId);
+            }
           }
         }
+      }
+
+      if (Date.now() - lastReclaimAt >= CLAIM_IDLE_MS) {
+        lastReclaimAt = Date.now();
+        await reclaimStalePending(ackRedis);
       }
     } catch (err) {
       console.error('[DBSync] Error:', err.message);
@@ -151,7 +193,11 @@ async function run() {
   }
 }
 
-run().catch((err) => {
-  console.error('[DBSync] Fatal error:', err);
-  process.exit(1);
-});
+if (require.main === module) {
+  run().catch((err) => {
+    console.error('[DBSync] Fatal error:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = { reclaimStalePending, toRecord, parseFields };
