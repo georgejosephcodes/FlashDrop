@@ -53,8 +53,23 @@ function enqueue(record) {
 async function flush() {
   if (buffer.length === 0) return;
 
-  const toInsert  = buffer.splice(0, buffer.length);  // drain buffer atomically
+  const rawBatch  = buffer.splice(0, buffer.length);  // drain buffer atomically
   lastFlushAt     = Date.now();
+
+  // Deduplicate by orderId within a single batch so Postgres ON CONFLICT never
+  // updates the same row twice in one INSERT statement.
+  const byOrderId = new Map();
+  for (const r of rawBatch) {
+    const prev = byOrderId.get(r.orderId);
+    byOrderId.set(r.orderId, prev ? {
+      ...prev,
+      ...r,
+      idempotencyKey: prev.idempotencyKey !== r.orderId ? prev.idempotencyKey : r.idempotencyKey,
+      amountCents:    r.amountCents || prev.amountCents,
+      holdExpiresAt:  r.holdExpiresAt ?? prev.holdExpiresAt,
+    } : r);
+  }
+  const toInsert = Array.from(byOrderId.values());
 
   // Build parameterised bulk INSERT
   // Each row needs 7 values → $1..$7, $8..$14, ...
@@ -76,7 +91,7 @@ async function flush() {
   const sql = `
     INSERT INTO orders (id, user_id, item_id, status, amount_cents, idempotency_key, hold_expires_at)
     VALUES ${placeholders.join(', ')}
-    ON CONFLICT (idempotency_key) DO UPDATE
+    ON CONFLICT (id) DO UPDATE
       SET status     = EXCLUDED.status,
           updated_at = NOW()
   `;
