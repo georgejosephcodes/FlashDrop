@@ -30,6 +30,7 @@ const metricsRoutes  = require('./routes/metrics.routes');
 const app    = express();
 const server = http.createServer(app);
 
+app.set('trust proxy', 1);
 app.use(express.json());
 
 // ── Health check ─────────────────────────────────────────────────────────────

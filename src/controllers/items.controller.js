@@ -1,6 +1,7 @@
-const { z }             = require('zod');
-const { query }         = require('../config/db');
-const { seedItemStock } = require('../services/redisService');
+const { z }              = require('zod');
+const { query }          = require('../config/db');
+const { getRedisClient } = require('../config/redis');
+const { seedItemStock }  = require('../services/redisService');
 
 const createItemSchema = z.object({
   title:         z.string().min(1).max(120),
@@ -12,12 +13,23 @@ const createItemSchema = z.object({
 
 /**
  * GET /api/items
- * Returns all items with live Redis stock in the response.
+ * Returns all items enriched with live Redis stock when available.
  */
-async function listItems(req, res) {
+async function listItems(_req, res) {
   try {
     const { rows } = await query('SELECT * FROM items ORDER BY created_at DESC');
-    return res.json(rows);
+    if (rows.length === 0) return res.json(rows);
+
+    const redis  = getRedisClient();
+    const keys   = rows.map(r => `item:${r.id}:stock`);
+    const stocks = await redis.mget(...keys);
+
+    const enriched = rows.map((row, idx) => ({
+      ...row,
+      available_stock: stocks[idx] !== null ? parseInt(stocks[idx], 10) : row.available_stock,
+    }));
+
+    return res.json(enriched);
   } catch (err) {
     console.error('[Items] listItems error:', err);
     return res.status(500).json({ error: 'Internal server error' });
@@ -27,10 +39,12 @@ async function listItems(req, res) {
 /**
  * POST /api/items  (admin seed endpoint — no auth for demo convenience)
  *
- * Inserts the item into Postgres AND seeds item:{id}:stock in Redis.
- * Both must succeed for the item to be active.
+ * Inserts the item into Postgres AND seeds item:{id}:stock + item:{id}:meta in Redis.
+ * Rolls back the PG row if Redis seeding fails.
  */
 async function createItem(req, res) {
+  let createdItemId = null;
+
   try {
     const parsed = createItemSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -39,7 +53,6 @@ async function createItem(req, res) {
 
     const { title, description, priceCents, totalStock, saleStartAt } = parsed.data;
 
-    // Insert into Postgres
     const { rows } = await query(
       `INSERT INTO items (title, description, price_cents, total_stock, available_stock, sale_start_at)
        VALUES ($1, $2, $3, $4, $4, $5)
@@ -47,18 +60,20 @@ async function createItem(req, res) {
       [title, description ?? null, priceCents, totalStock, saleStartAt]
     );
 
-    const item = rows[0];
+    const item    = rows[0];
+    createdItemId = item.id;
 
-    // Seed Redis stock counter — must match Postgres available_stock
-    await seedItemStock(item.id, totalStock);
+    await seedItemStock(item.id, totalStock, { priceCents, saleStartAt });
 
     return res.status(201).json(item);
 
   } catch (err) {
+    if (createdItemId) {
+      await query('DELETE FROM items WHERE id = $1', [createdItemId]).catch(() => {});
+    }
     console.error('[Items] createItem error:', err);
     return res.status(500).json({ error: 'Internal server error' });
   }
 }
 
 module.exports = { listItems, createItem };
-
