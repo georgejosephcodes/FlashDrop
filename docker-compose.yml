@@ -58,6 +58,26 @@ services:
       - postgres
     restart: unless-stopped
 
+  db-sync-worker:
+    build: .
+    container_name: flashdrop-db-sync-worker
+    command: node src/workers/dbSyncWorker.js
+    env_file: .env
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  reclaim-worker:
+    build: .
+    container_name: flashdrop-reclaim-worker
+    command: node src/workers/autoReclaimWorker.js
+    env_file: .env
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
   nginx:
     image: nginx:alpine
     container_name: flashdrop-nginx
