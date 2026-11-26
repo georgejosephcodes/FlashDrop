@@ -1,10 +1,12 @@
 const { getRedisClient } = require('../config/redis');
 
 /**
- * Sliding-window rate limiter — 20 requests / second per IP.
- * Uses Redis INCR + EXPIRE so the window resets cleanly each second.
- * Returns 429 Too Many Requests when the limit is exceeded.
+ * Sliding-window rate limiter per IP.
+ * Limit is configurable via RATE_LIMIT_PER_SECOND env var (default 20).
+ * Set RATE_LIMIT_PER_SECOND=10000 when running benchmarks locally.
  */
+const LIMIT = parseInt(process.env.RATE_LIMIT_PER_SECOND || '20', 10);
+
 async function rateLimiter(req, res, next) {
   const redis = getRedisClient();
   const ip    = req.ip || req.socket.remoteAddress;
@@ -13,13 +15,12 @@ async function rateLimiter(req, res, next) {
   const count = await redis.incr(key);
 
   if (count === 1) {
-    // First hit in this window — set 1-second expiry
     await redis.expire(key, 1);
   }
 
-  if (count > 20) {
+  if (count > LIMIT) {
     return res.status(429).json({
-      error: 'Too many requests. Limit: 20 requests per second.',
+      error: `Too many requests. Limit: ${LIMIT} requests per second.`,
     });
   }
 
