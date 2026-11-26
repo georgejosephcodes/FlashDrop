@@ -9,8 +9,10 @@ const envSchema = z.object({
   DATABASE_URL:       z.string().url(),
   REDIS_URL:          z.string().url(),
 
-  CLERK_PUBLISHABLE_KEY: z.string().min(1),
-  CLERK_SECRET_KEY:      z.string().min(1),
+  // Clerk keys are optional when SKIP_AUTH=true (local dev / testing)
+  SKIP_AUTH:             z.string().default('false'),
+  CLERK_PUBLISHABLE_KEY: z.string().default(''),
+  CLERK_SECRET_KEY:      z.string().default(''),
 
   HOLD_TTL_SECONDS:   z.string().default('600').transform(Number),
   SYNC_BATCH_SIZE:    z.string().default('50').transform(Number),
@@ -25,5 +27,13 @@ if (!parsed.success) {
   process.exit(1);
 }
 
-module.exports = parsed.data;
+const data = parsed.data;
+
+// Enforce Clerk keys only when auth is not skipped
+if (data.SKIP_AUTH !== 'true' && (!data.CLERK_PUBLISHABLE_KEY || !data.CLERK_SECRET_KEY)) {
+  console.error('❌  CLERK_PUBLISHABLE_KEY and CLERK_SECRET_KEY are required when SKIP_AUTH is not true.');
+  process.exit(1);
+}
+
+module.exports = data;
 
