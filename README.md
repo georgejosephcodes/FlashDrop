@@ -111,8 +111,8 @@ sequenceDiagram
 |---|---|
 | Ingest throughput | **2,500 req/s** |
 | Latency p50 | **55 ms** |
-| Latency p95 | **72 ms** |
-| Latency p99 | **791 ms** |
+| Latency p95 | **71 ms** |
+| Latency p99 | **844 ms** |
 | Orders created | **100 / 100** |
 | Oversold units | **0** |
 | 5xx errors | **0** |
@@ -242,7 +242,3 @@ benchmark/
 sql/init.sql                     ← PostgreSQL schema
 nginx/nginx.conf                 ← Load balancer config
 ```
-
----
-
-*Built by George Joseph — SDE Intern Project, 2026*
