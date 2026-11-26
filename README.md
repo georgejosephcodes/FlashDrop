@@ -108,15 +108,15 @@ sequenceDiagram
 | Metric | Result |
 |---|---|
 | Ingest throughput | **2,500 req/s** |
-| Latency p50 | **50 ms** |
-| Latency p95 | **71 ms** |
-| Latency p99 | **984 ms** |
+| Latency p50 | **55 ms** |
+| Latency p95 | **72 ms** |
+| Latency p99 | **791 ms** |
 | Orders created | **100 / 100** |
 | Oversold units | **0** |
 | 5xx errors | **0** |
 | DB connections under load | < 10 |
 
-> Run `npm run benchmark` then `npm run verify` to reproduce these numbers.
+> Run `npm test`, `npm run benchmark`, then `npm run verify` to reproduce these results.
 
 ---
 

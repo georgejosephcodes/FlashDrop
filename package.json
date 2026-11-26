@@ -8,6 +8,7 @@
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
     "worker": "node src/workers/orderProcessorWorker.js",
+    "test": "jest --runInBand",
     "benchmark": "node benchmark/load-test.js",
     "verify": "node benchmark/verify-integrity.js",
     "docker:up": "docker compose up --build",
