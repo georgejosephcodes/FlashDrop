@@ -5,7 +5,7 @@ services:
     container_name: flashdrop-redis
     command: redis-server --appendonly yes
     ports:
-      - "6379:6379"
+      - "6380:6379"
     volumes:
       - redis-data:/data
     restart: unless-stopped
@@ -18,7 +18,7 @@ services:
       POSTGRES_PASSWORD: flashdrop
       POSTGRES_DB: flashdrop
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
