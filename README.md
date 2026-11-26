@@ -8,37 +8,85 @@ FlashDrop eliminates database row-locking bottlenecks by decoupling the ingest l
 
 ## Architecture
 
+```mermaid
+flowchart TD
+    C["Client Burst (10,000+ req / 200 conns)"] -->|POST /api/orders/checkout| NGX["Nginx Reverse Proxy (ip_hash · rate limit · WS upgrade)"]
+
+    NGX --> A1["Express Replica (app1)"]
+    NGX --> A2["Express Replica (app2)"]
+
+    subgraph Ingest["Synchronous Ingest Path (Redis In-Memory)"]
+        direction TB
+        MW["Idempotency (SET NX) → Rate Limiter → Clerk Auth"]
+        LUA["reserve_stock.lua (Atomic GET + DECR)"]
+        MW --> LUA
+    end
+
+    A1 --> MW
+    A2 --> MW
+
+    LUA -->|"stock <= 0"| S409["409 SOLD_OUT (Immediate Reject)"]
+    LUA -->|"stock > 0"| XADD["XADD orders:stream → 202 RESERVED"]
+
+    subgraph Async["Asynchronous Consumer Groups & Workers"]
+        direction LR
+        OP["orderProcessorWorker (Group: orderProcessors)"]
+        AR["autoReclaimWorker (Polls holds:expiry every 5s)"]
+        DBS["dbSyncWorker + syncService (Group: dbSyncers)"]
+    end
+
+    XADD --> OP
+    XADD --> DBS
+
+    OP -->|"SET hold + ZADD holds:expiry"| REDIS[("Redis 7 (Stock · Holds · Stream · Pub/Sub)")]
+    OP -->|"PUBLISH order:events"| WS["Socket.io + Redis Adapter (app1 & app2)"]
+    WS -->|"room:user_{id}"| C
+
+    AR -->|"Expired → INCR stock + OrderExpired"| REDIS
+    AR -->|"XADD OrderExpired"| DBS
+    DBS -->|"Bulk UPSERT (50 rows or 500ms)"| PG[("PostgreSQL 16 (Durable System of Record)")]
 ```
-Client (10,000+ concurrent)
-        │
-        ▼  POST /api/orders/checkout  (<5ms)
-   NGINX  (rate limit · sticky sessions · WS upgrade)
-        │
-   ┌────┴────┐
-  app1      app2   ← Stateless Express replicas
-   └────┬────┘
-        │
-  [1] Idempotency check    → Redis SET NX EX
-  [2] Auth check           → Clerk requireAuth()
-  [3] Lua atomic script    → reserve_stock.lua (O(1))
-        │ SOLD_OUT → 409   │ SUCCESS → XADD orders:stream
-        ▼
-     202 Accepted          ← HTTP connection closed immediately
 
-─── ASYNC ──────────────────────────────────────────────────────
+---
 
-  orderProcessorWorker     ← XREADGROUP, creates hold, ZADD expiry, XACK
-        │
-        ▼ PUBLISH order:events
-  Socket.io + Redis Adapter → room:user_{id} → order:reserved
+## Order Lifecycle & Race Prevention
 
-  autoReclaimWorker        ← polls holds:expiry sorted set every 5s
-        │ expired → INCR stock → PUBLISH order:expired
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant API as Express API (app1 / app2)
+    participant Redis as Redis (Lua + Stream + Holds)
+    participant Workers as Async Workers (Processor / Reclaim / DBSync)
+    participant DB as PostgreSQL 16
 
-  dbSyncWorker             ← second consumer group
-        │ → syncService buffer → bulk INSERT (50 records / 500ms)
-        ▼
-   PostgreSQL 16            ← durable system of record
+    User->>API: POST /api/orders/checkout (X-Idempotency-Key)
+    API->>Redis: SET idempotency:{key} NX EX 86400
+    API->>Redis: EVALSHA reserve_stock.lua
+    alt Stock == 0
+        Redis-->>API: 0 (SOLD_OUT)
+        API-->>User: 409 Conflict (Immediate)
+    else Stock > 0
+        Redis-->>API: 1 (Stock decremented atomically)
+        API->>Redis: XADD orders:stream OrderReserved
+        API-->>User: 202 Accepted (orderId, holdExpiresAt)
+    end
+
+    Workers->>Redis: XREADGROUP orderProcessors → SET hold + ZADD holds:expiry
+    Workers-->>User: WebSocket push (order:reserved)
+    Workers->>DB: Write-Behind bulk UPSERT (50 records or 500ms)
+
+    alt User Pays Within 10 Minutes
+        User->>API: POST /api/orders/:id/pay
+        API->>Redis: DEL hold:{orderId} + ZREM holds:expiry
+        API->>Redis: XADD orders:stream OrderConfirmed
+        API-->>User: 200 OK (CONFIRMED)
+        Workers-->>User: WebSocket push (order:confirmed)
+    else Hold Expires (Timeout)
+        Workers->>Redis: ZRANGEBYSCORE holds:expiry 0 now
+        Workers->>Redis: INCR item:{id}:stock + XADD OrderExpired
+        Workers-->>User: WebSocket push (order:expired)
+    end
 ```
 
 ---
@@ -55,16 +103,17 @@ Client (10,000+ concurrent)
 
 ## Benchmark Results
 
-> Seeded item with `totalStock = 100`, fired 10,000 requests in burst with 200 concurrent connections.
+> Seeded item with `totalStock = 100`, fired 10,000 unique requests in burst with 200 concurrent connections (`autocannon` with `idReplacement`).
 
 | Metric | Result |
 |---|---|
-| Ingest throughput | TBD req/s |
-| Latency p50 | TBD ms |
-| Latency p95 | TBD ms |
-| Latency p99 | TBD ms |
-| Orders created | TBD / 100 |
+| Ingest throughput | **2,500 req/s** |
+| Latency p50 | **50 ms** |
+| Latency p95 | **71 ms** |
+| Latency p99 | **984 ms** |
+| Orders created | **100 / 100** |
 | Oversold units | **0** |
+| 5xx errors | **0** |
 | DB connections under load | < 10 |
 
 > Run `npm run benchmark` then `npm run verify` to reproduce these numbers.
@@ -78,12 +127,12 @@ Client (10,000+ concurrent)
 | API | Node.js + Express |
 | Auth | Clerk (`@clerk/express`) |
 | API Docs | Scalar — interactive OpenAPI 3.1 playground at `/docs` |
-| In-Memory Core | Redis 7 — Streams + Lua scripts |
+| In-Memory Core | Redis 7 — Streams + Lua scripts + Sorted Sets + Pub/Sub |
 | Real-Time | Socket.io + `@socket.io/redis-adapter` |
 | Database | PostgreSQL 16 |
 | Validation | Zod |
 | Load Testing | Autocannon |
-| Infrastructure | Docker Compose + Nginx |
+| Infrastructure | Docker Compose (8 services) + Nginx |
 
 ---
 
@@ -93,14 +142,15 @@ Client (10,000+ concurrent)
 
 ```bash
 # 1. Clone
-git clone https://github.com/YOUR_USERNAME/FlashDrop.git
+git clone https://github.com/georgejosephcodes/FlashDrop.git
 cd FlashDrop
 
 # 2. Configure
 cp .env.example .env
 # Edit .env — set SKIP_AUTH=true for local dev (no Clerk account needed)
+# Create .env.local with localhost:5433 / localhost:6380 for running host scripts
 
-# 3. Boot everything
+# 3. Boot everything (Nginx, 2 API replicas, 3 workers, Redis, Postgres)
 docker compose up --build
 ```
 
@@ -111,18 +161,18 @@ docker compose up --build
 ## Running the Benchmark
 
 ```bash
-# 1. Make sure docker compose is running
+# 1. Make sure docker compose is running (with RATE_LIMIT_PER_SECOND=10000 in .env)
 
 # 2. Seed a benchmark item (stock = 100)
 curl -s -X POST http://localhost:8080/api/items \
   -H "Content-Type: application/json" \
-  -d '{"title":"Benchmark Item","priceCents":100,"totalStock":100,"saleStartAt":"2026-01-01T00:00:00Z"}' \
-  | jq .id
+  -d '{"title":"Benchmark Drop","priceCents":100,"totalStock":100,"saleStartAt":"2026-01-01T00:00:00Z"}' \
+  | jq -r .id
 
-# 3. Run the load test (replace ITEM_ID with the UUID from step 2)
+# 3. Run the load test (replace <uuid> with the ID from step 2)
 ITEM_ID=<uuid> npm run benchmark
 
-# 4. Verify zero overselling
+# 4. Verify zero overselling & DB conservation
 ITEM_ID=<uuid> TOTAL_STOCK=100 npm run verify
 ```
 
@@ -166,8 +216,8 @@ Flush on 50 records **or** 500ms elapsed — whichever comes first. Prevents bot
 **3. Two consumer groups on the same stream**
 `orderProcessors` (creates holds, pushes WebSocket) and `dbSyncers` (persists to Postgres) are independent — a slow DB never blocks real-time push.
 
-**4. `ON CONFLICT DO UPDATE` in bulk INSERT**
-Makes every DB sync flush idempotent. Worker restarts that re-process stream entries update the row's status rather than failing with a duplicate key error.
+**4. `ON CONFLICT (id) DO UPDATE` with batch deduplication**
+Makes every DB sync flush idempotent across `OrderReserved`, `OrderConfirmed`, and `OrderExpired` transitions without duplicate key failures.
 
 ---
 
@@ -194,4 +244,3 @@ nginx/nginx.conf                 ← Load balancer config
 ---
 
 *Built by George Joseph — SDE Intern Project, 2026*
-
